@@ -1,116 +1,185 @@
 #!/usr/bin/env python3
 """
-NPM Package Compression Benchmark
-Tests gzip, bzip2, xz/lzma compression.
+NPM Package Compression Benchmark - Complete Implementation
+Tests gzip, bzip2, xz with level sweeps, decompression timing, and verification.
 """
 
 import subprocess
 import time
 import os
+import hashlib
+import statistics
 from pathlib import Path
 import tarfile
 import gzip
 import bz2
 import lzma
+import sys
+import platform
 
 def get_dir_size(path):
+    """Get total size of directory"""
     return sum(f.stat().st_size for f in Path(path).rglob('*') if f.is_file())
 
-def benchmark_python_tar(pkg_path, mode):
-    """Benchmark Python tarfile compression"""
-    output = Path(f"/tmp/{pkg_path.name}.tar.{mode.split(':')[1]}")
-    if output.exists():
-        output.unlink()
+def get_file_count(path):
+    """Get file count"""
+    return sum(1 for _ in Path(path).rglob('*') if _.is_file())
+
+def sha256_tree(path):
+    """Calculate SHA256 of directory tree structure and contents"""
+    h = hashlib.sha256()
+    for f in sorted(Path(path).rglob('*')):
+        if f.is_file():
+            rel_path = str(f.relative_to(path))
+            h.update(rel_path.encode('utf-8'))
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+def benchmark_compression(name, compress_func, decompress_func, 
+                         source_dir, archive_path, extract_dir, trials=3):
+    """Benchmark compression with multiple trials"""
+    print(f"\n  {name}:")
     
-    start = time.perf_counter()
-    with tarfile.open(output, f"w:{mode.split(':')[1]}") as tar:
-        tar.add(pkg_path, arcname=pkg_path.name)
-    elapsed = time.perf_counter() - start
+    compress_times = []
+    decompress_times = []
+    sizes = []
     
-    size = output.stat().st_size
-    output.unlink()
-    return elapsed, size
+    original_checksum = sha256_tree(source_dir)
+    original_size = get_dir_size(source_dir)
+    
+    for trial in range(trials):
+        # Clean up from previous trial
+        if archive_path.exists():
+            archive_path.unlink()
+        if extract_dir.exists():
+            import shutil
+            shutil.rmtree(extract_dir)
+        
+        # Compression
+        start = time.perf_counter()
+        try:
+            compress_func(source_dir, archive_path)
+            compress_time = time.perf_counter() - start
+            compress_success = archive_path.exists()
+        except Exception as e:
+            print(f"    Trial {trial+1}: Compress failed - {e}")
+            return None
+        
+        if not compress_success:
+            print(f"    Trial {trial+1}: No output file")
+            return None
+        
+        compressed_size = archive_path.stat().st_size
+        
+        # Decompression
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        start = time.perf_counter()
+        try:
+            decompress_func(archive_path, extract_dir)
+            decompress_time = time.perf_counter() - start
+        except Exception as e:
+            print(f"    Trial {trial+1}: Decompress failed - {e}")
+            decompress_time = 0
+        
+        # Verify
+        extracted = list(extract_dir.iterdir())
+        verified = False
+        if extracted and extracted[0].is_dir():
+            extracted_checksum = sha256_tree(extracted[0])
+            verified = (extracted_checksum == original_checksum)
+        
+        compress_times.append(compress_time)
+        decompress_times.append(decompress_time)
+        sizes.append(compressed_size)
+        
+        print(f"    Trial {trial+1}: {compress_time*1000:.1f}ms / "
+              f"{decompress_time*1000:.1f}ms, {compressed_size/1024:.1f}KB, "
+              f"{'✓' if verified else '✗'}")
+    
+    return {
+        'name': name,
+        'compress_mean': statistics.mean(compress_times) * 1000,
+        'compress_min': min(compress_times) * 1000,
+        'decompress_mean': statistics.mean(decompress_times) * 1000,
+        'compressed_size': statistics.mean(sizes),
+        'original_size': original_size,
+        'ratio': statistics.mean(sizes) / original_size,
+        'verified': verified,
+        'trials': compress_times
+    }
+
+def compress_gzip(src, dst, level=6):
+    with tarfile.open(dst, f"w:gz", compresslevel=level) as tar:
+        tar.add(src, arcname=src.name)
+
+def decompress_gzip(src, dst):
+    with tarfile.open(src, "r:gz") as tar:
+        tar.extractall(dst)
+
+def compress_bz2(src, dst):
+    with tarfile.open(dst, "w:bz2") as tar:
+        tar.add(src, arcname=src.name)
+
+def decompress_bz2(src, dst):
+    with tarfile.open(src, "r:bz2") as tar:
+        tar.extractall(dst)
+
+def compress_xz(src, dst, preset=6):
+    with tarfile.open(dst, "w:xz", preset=preset) as tar:
+        tar.add(src, arcname=src.name)
+
+def decompress_xz(src, dst):
+    with tarfile.open(src, "r:xz") as tar:
+        tar.extractall(dst)
 
 def main():
+    import shutil
     print("=" * 70)
     print("NPM Package Compression Benchmark")
     print("=" * 70)
     
     corpus_dir = Path("corpus")
-    if not corpus_dir.exists():
-        print("Error: Run 'python3 generate_corpus.py' first")
-        return
-    
     results = []
+    tmp_dir = Path("/tmp/npm-bench")
+    tmp_dir.mkdir(exist_ok=True)
     
-    for pkg_dir in sorted(corpus_dir.iterdir()):
-        if not pkg_dir.is_dir():
-            continue
-        
+    for pkg_dir in sorted([d for d in corpus_dir.iterdir() if d.is_dir()]):
         print(f"\n{pkg_dir.name}:")
-        original_size = get_dir_size(pkg_dir)
-        file_count = sum(1 for _ in pkg_dir.rglob('*') if _.is_file())
-        print(f"  Original: {original_size/1024:.1f} KB, {file_count} files")
+        size = get_dir_size(pkg_dir)
+        count = get_file_count(pkg_dir)
+        print(f"  {size/1024:.1f} KB, {count} files")
         
-        # Test Python gzip
-        try:
-            elapsed, size = benchmark_python_tar(pkg_dir, "w:gz")
-            ratio = size / original_size
-            print(f"  Python gzip: {elapsed*1000:.1f}ms, {size/1024:.1f}KB ({ratio:.1%})")
-            results.append({
-                'package': pkg_dir.name,
-                'compressor': 'python-gzip',
-                'time_ms': elapsed * 1000,
-                'size': size,
-                'ratio': ratio
-            })
-        except Exception as e:
-            print(f"  Python gzip: Failed - {e}")
+        tests = [
+            ("gzip-1", lambda s, d: compress_gzip(s, d, 1), decompress_gzip),
+            ("gzip-6", lambda s, d: compress_gzip(s, d, 6), decompress_gzip),
+            ("gzip-9", lambda s, d: compress_gzip(s, d, 9), decompress_gzip),
+            ("bzip2", compress_bz2, decompress_bz2),
+            ("xz-6", lambda s, d: compress_xz(s, d, 6), decompress_xz),
+        ]
         
-        # Test Python bzip2
-        try:
-            elapsed, size = benchmark_python_tar(pkg_dir, "w:bz2")
-            ratio = size / original_size
-            print(f"  Python bzip2: {elapsed*1000:.1f}ms, {size/1024:.1f}KB ({ratio:.1%})")
-            results.append({
-                'package': pkg_dir.name,
-                'compressor': 'python-bz2',
-                'time_ms': elapsed * 1000,
-                'size': size,
-                'ratio': ratio
-            })
-        except Exception as e:
-            print(f"  Python bzip2: Failed - {e}")
-        
-        # Test Python xz
-        try:
-            elapsed, size = benchmark_python_tar(pkg_dir, "w:xz")
-            ratio = size / original_size
-            print(f"  Python xz: {elapsed*1000:.1f}ms, {size/1024:.1f}KB ({ratio:.1%})")
-            results.append({
-                'package': pkg_dir.name,
-                'compressor': 'python-xz',
-                'time_ms': elapsed * 1000,
-                'size': size,
-                'ratio': ratio
-            })
-        except Exception as e:
-            print(f"  Python xz: Failed - {e}")
+        for name, comp, decomp in tests:
+            archive = tmp_dir / f"{pkg_dir.name}.tar"
+            extract = tmp_dir / "extracted"
+            r = benchmark_compression(name, comp, decomp, pkg_dir, archive, extract)
+            if r:
+                r['package'] = pkg_dir.name
+                results.append(r)
+                if archive.exists():
+                    archive.unlink()
+                if extract.exists():
+                    shutil.rmtree(extract)
     
     # Save results
-    print("\n" + "=" * 70)
     with open("RESULTS.md", "w") as f:
-        f.write("# NPM Package Compression Results\n\n")
-        f.write("| Package | Compressor | Time (ms) | Size (KB) | Ratio |\n")
-        f.write("|---------|------------|-----------|-----------|-------|\n")
+        f.write("# Results\n\n")
+        f.write("| Package | Compressor | Compress | Decompress | Size | Ratio | Verified |\n")
+        f.write("|---------|------------|----------|------------|------|-------|----------|\n")
         for r in results:
-            f.write(f"| {r['package']} | {r['compressor']} | {r['time_ms']:.1f} | "
-                   f"{r['size']/1024:.1f} | {r['ratio']:.1%} |\n")
+            f.write(f"| {r['package']} | {r['name']} | {r['compress_mean']:.1f}ms | "
+                   f"{r['decompress_mean']:.1f}ms | {r['compressed_size']/1024:.1f}KB | "
+                   f"{r['ratio']:.1%} | {'✓' if r['verified'] else '✗'} |\n")
     
-    print("✓ Results saved to RESULTS.md")
-    print("\nNote: Install brotli, zstd, and hyperfine for complete comparison")
-    print("  pip install brotli zstandard")
-    print("  apt-get install hyperfine")
+    print("\n✓ Complete - see RESULTS.md")
 
 if __name__ == "__main__":
     main()
